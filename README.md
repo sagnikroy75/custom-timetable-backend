@@ -199,4 +199,3 @@ server/types.ts                 shared types
 | `npm run lint` | Type-check |
 ```
 
-Just paste that into your `README.md` file and it should render cleanly.
