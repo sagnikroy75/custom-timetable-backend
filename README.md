@@ -9,8 +9,8 @@ This is a Fastify + MongoDB API for timetable events. It handles CRUD, recurring
 ## 🚀 Run It
 
 ```sh
-npm install
-npm run dev    # or: npm start
+npm install @fastify/swagger-ui
+npm run dev # run the "dev" package script
 ```
 
 - **API:** `http://localhost:3000`
