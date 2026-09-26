@@ -1,11 +1,12 @@
+// This file turns timetable events into a standard calendar file (.ics).
+// The .ics format (RFC 5545) is the common format understood by calendar apps
+// such as Apple Calendar, Google Calendar, Outlook, and phone calendars.
+
 import type { CustomEvent } from './types';
 
-/**
- * RFC 5545 iCalendar (ICS) Serializer
- * Formats custom timetable events into standard .ics format
- * compatible with Apple Calendar, Google Calendar, Outlook, and mobile apps.
- */
-
+// Converts an ISO timestamp into the compact format used inside .ics files.
+// Example: "2026-09-22T14:30:00.000Z" becomes "20260922T143000Z".
+// The function removes dashes, colons, and the milliseconds part.
 function formatICSDate(isoString: string): string {
   const date = new Date(isoString);
   return date
@@ -14,6 +15,10 @@ function formatICSDate(isoString: string): string {
     .replace(/\.\d{3}/, '');
 }
 
+// Makes text safe to include in an .ics file.
+// Calendar format reserves the characters backslash, semicolon, comma, and
+// newline, so those get a backslash put in front of them. This stops text
+// like "Smith, John" from confusing calendar apps.
 function escapeICSText(str: string): string {
   if (!str) return '';
   return str
@@ -23,6 +28,23 @@ function escapeICSText(str: string): string {
     .replace(/\n/g, '\\n');
 }
 
+// Builds the complete .ics file content from a list of events.
+//
+// Parameters:
+// - events: the events to include in the calendar.
+// - calendarName: an optional name for the calendar (defaults to "Custom Timetable").
+//
+// How it works:
+// - It starts the file with the calendar header lines.
+// - For each event it writes a VEVENT block with start/end times, title,
+//   description, location, category, an optional repeating rule (RRULE),
+//   and a reminder alarm if the event has reminders.
+// - Only "master" events are exported. Generated occurrences of a repeating
+//   series are skipped, because the repeating rule already covers them.
+// - It ends the file with the calendar footer and joins all lines with
+//   Windows-style line breaks (\r\n) which is the calendar standard.
+//
+// Returns the whole .ics file as a single string.
 export function generateICS(events: CustomEvent[], calendarName = 'Custom Timetable'): string {
   const lines: string[] = [
     'BEGIN:VCALENDAR',
@@ -57,7 +79,8 @@ export function generateICS(events: CustomEvent[], calendarName = 'Custom Timeta
       lines.push(`CATEGORIES:${event.category.toUpperCase()}`);
     }
 
-    // Recurrence rule
+    // Recurrence rule - this tells calendar apps how often the event repeats
+    // (for example every week on Wednesdays) and when it stops.
     if (event.recurrence) {
       const r = event.recurrence;
       const rruleParts: string[] = [`FREQ=${r.frequency}`];
@@ -75,7 +98,8 @@ export function generateICS(events: CustomEvent[], calendarName = 'Custom Timeta
       lines.push(`RRULE:${rruleParts.join(';')}`);
     }
 
-    // Alarm reminder
+    // Alarm reminder - the earliest reminder minutes are turned into an
+    // alert that fires before the event starts.
     if (event.reminders && event.reminders.length > 0) {
       const earliest = Math.min(...event.reminders);
       lines.push('BEGIN:VALARM');

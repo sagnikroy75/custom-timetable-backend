@@ -1,3 +1,18 @@
+// This file wires up the event endpoints - the heart of the timetable API.
+// It registers routes for:
+// - listing events with filters (GET /events),
+// - getting one event (GET /events/:id),
+// - creating an event (POST /events),
+// - updating an event (PUT/PATCH /events/:id),
+// - deleting an event (DELETE /events/:id),
+// - checking for schedule clashes (POST /events/detect-clashes),
+// - finding free time slots (GET /events/free-slots),
+// - exporting the timetable as a calendar file (GET /events/export.ics).
+//
+// All of these require authentication, and every database lookup is scoped
+// to the logged-in user so students can only touch their own events.
+// Each route is registered twice: under the root path and under /api.
+
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import crypto from 'crypto';
 import { requireAuth } from '../auth';
@@ -7,6 +22,13 @@ import { generateICS } from '../ics';
 import type { CustomEvent } from '../types';
 
 export function registerEventRoutes(app: FastifyInstance) {
+  // Lists the current user's events.
+  // Optional query filters:
+  // - start / end: only events touching this time range.
+  // - category: only events of this category.
+  // - search: keyword matching against title/description/location.
+  // - expandRecurring: "false" keeps repeating events as one master event,
+  //   otherwise they are expanded into occurrences inside the time range.
   const listEventsHandler = async (req: FastifyRequest) => {
     const userId = req.user!.id;
     const query = (req.query || {}) as {
@@ -44,6 +66,8 @@ export function registerEventRoutes(app: FastifyInstance) {
     const queryEnd = query.end ? new Date(query.end).getTime() : null;
 
     if (shouldExpand && queryStart !== null && queryEnd !== null) {
+      // Expanding: single events are kept if they touch the range, and
+      // repeating events are expanded into concrete occurrences.
       const expandedList: CustomEvent[] = [];
       for (const evt of events) {
         if (!evt.recurrence) {
@@ -59,6 +83,7 @@ export function registerEventRoutes(app: FastifyInstance) {
       }
       events = expandedList;
     } else if (!shouldExpand) {
+      // Not expanding: keep master events that overlap the range.
       if (queryStart !== null) {
         events = events.filter((e) => new Date(e.endTime).getTime() >= queryStart);
       }
@@ -75,6 +100,7 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.get('/events', { preHandler: requireAuth }, listEventsHandler);
   app.get('/api/events', { preHandler: requireAuth }, listEventsHandler);
 
+  // Returns a single event, but only if it belongs to the logged-in user.
   const getEventHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const params = req.params as { id: string };
@@ -89,6 +115,10 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.get('/events/:id', { preHandler: requireAuth }, getEventHandler);
   app.get('/api/events/:id', { preHandler: requireAuth }, getEventHandler);
 
+  // Creates a new event for the logged-in user.
+  // It validates the required fields and times, saves the event to MongoDB,
+  // syncs it into the in-memory store, and checks for scheduling clashes so
+  // the response can warn about overlaps.
   const createEventHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const body = (req.body || {}) as Partial<CustomEvent>;
@@ -149,6 +179,9 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.post('/events', { preHandler: requireAuth }, createEventHandler);
   app.post('/api/events', { preHandler: requireAuth }, createEventHandler);
 
+  // Updates an existing event. Used by both PUT (replace) and PATCH
+  // (partial update). It only changes the fields that were actually sent,
+  // validates any new times, and syncs the change into the in-memory store.
   const updateEventHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const params = req.params as { id: string };
@@ -178,6 +211,7 @@ export function registerEventRoutes(app: FastifyInstance) {
       updatedAt,
     };
 
+    // Copy each provided field into the update request.
     if (body.title !== undefined) updateFields.title = body.title.trim();
     if (body.description !== undefined) updateFields.description = body.description.trim();
     if (body.location !== undefined) updateFields.location = body.location.trim();
@@ -211,6 +245,8 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.patch('/events/:id', { preHandler: requireAuth }, updateEventHandler);
   app.patch('/api/events/:id', { preHandler: requireAuth }, updateEventHandler);
 
+  // Deletes an event (scoped to the logged-in user) from both MongoDB and
+  // the in-memory store.
   const deleteEventHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const params = req.params as { id: string };
@@ -227,7 +263,9 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.delete('/events/:id', { preHandler: requireAuth }, deleteEventHandler);
   app.delete('/api/events/:id', { preHandler: requireAuth }, deleteEventHandler);
 
-  // Detect Clashes
+  // Checks whether a proposed time window overlaps any of the user's events.
+  // An optional excludeEventId can be passed so an event can be updated
+  // without clashing with itself.
   const detectClashesHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const body = (req.body || {}) as { startTime: string; endTime: string; excludeEventId?: string };
@@ -246,7 +284,9 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.post('/events/detect-clashes', { preHandler: requireAuth }, detectClashesHandler);
   app.post('/api/events/detect-clashes', { preHandler: requireAuth }, detectClashesHandler);
 
-  // Free Slots
+  // Finds free time blocks on a given day.
+  // Query parameters: date (required, YYYY-MM-DD), plus optional
+  // minDurationMinutes, dayStartHour, dayEndHour to control the search.
   const freeSlotsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const query = (req.query || {}) as {
@@ -274,7 +314,9 @@ export function registerEventRoutes(app: FastifyInstance) {
   app.get('/events/free-slots', { preHandler: requireAuth }, freeSlotsHandler);
   app.get('/api/events/free-slots', { preHandler: requireAuth }, freeSlotsHandler);
 
-  // iCalendar RFC 5545 Export
+  // Exports the user's timetable as a standard .ics calendar file that can be
+  // imported into Apple/Google/Outlook calendars. The file is served as a
+  // download with a filename like timetable-alice.ics.
   const exportIcsHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const userId = req.user!.id;
     const user = await mongoService.usersCollection.findOne({ id: userId });

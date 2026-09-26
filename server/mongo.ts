@@ -1,19 +1,34 @@
+// This file manages how events and users are saved.
+//
+// The server supports two ways of storing data:
+// 1. A real MongoDB database (if a MONGODB_URI is set in the environment).
+// 2. A built-in in-memory store that behaves like MongoDB, used as a fallback
+//    when no real database is available (useful for quick testing).
+//
+// Both styles expose the same simple interface, so the rest of the code does
+// not care which one is running underneath.
+
 import { MongoClient, Db, ServerApiVersion } from 'mongodb';
 import crypto from 'crypto';
 import { hashPassword } from './auth';
 import type { CustomEvent, User } from './types';
 
+// A saved event document in the database. Same fields as a CustomEvent,
+// but the _id is the database's own internal key.
 export interface MongoEventDoc extends Omit<CustomEvent, 'id'> {
   _id?: string;
   id: string;
 }
 
+// A saved user document in the database. Same fields as a User,
+// plus the database's own _id key.
 export interface MongoUserDoc extends Omit<User, 'id'> {
   _id?: string;
   id: string;
 }
 
-// Interface representing standard MongoDB Collection operations
+// The operations that any data store must support.
+// This is a promise-based interface: every method returns a Promise.
 export interface IMongoCollection<T extends { id: string }> {
   find(filter?: Record<string, any>): { toArray(): Promise<T[]> };
   findOne(filter: Record<string, any>): Promise<T | null>;
@@ -24,7 +39,10 @@ export interface IMongoCollection<T extends { id: string }> {
   createIndex(indexSpec: Record<string, number>, options?: Record<string, any>): Promise<string>;
 }
 
-// In-Memory MongoDB-compatible Collection for resilience in sandboxed environments
+// An in-memory data store that behaves like a MongoDB collection.
+// Data is kept in a JavaScript Map, so it disappears when the server stops.
+// It implements the operations needed and understands a few MongoDB query
+// operators ($regex, $gte, $lte, $gt, $lt, $in, $ne) for basic filtering.
 class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollection<T> {
   private docs: Map<string, T> = new Map();
   private name: string;
@@ -33,6 +51,9 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
     this.name = name;
   }
 
+  // Returns a result object with a toArray() method that gives the matching documents.
+  // It walks through every stored document and keeps only the ones whose fields
+  // satisfy all the filter conditions.
   find(filter: Record<string, any> = {}): { toArray(): Promise<T[]> } {
     const all = Array.from(this.docs.values());
     const matches = all.filter((doc) => {
@@ -51,6 +72,7 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
           if ('$in' in val && Array.isArray(val.$in) && !val.$in.includes(docVal)) return false;
           if ('$ne' in val && docVal === val.$ne) return false;
         } else if (val !== undefined) {
+          // Plain value: the document field must equal it exactly.
           if (docVal !== val) return false;
         }
       }
@@ -61,11 +83,14 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
     };
   }
 
+  // Returns the first document matching the filter, or null if none match.
   async findOne(filter: Record<string, any>): Promise<T | null> {
     const list = await this.find(filter).toArray();
     return list[0] || null;
   }
 
+  // Saves a new document. If the document has no id, one is created.
+  // Returns the new id and whether the insert was acknowledged.
   async insertOne(doc: T): Promise<{ insertedId: string; acknowledged: boolean }> {
     const id = doc.id || `doc_${crypto.randomUUID().slice(0, 8)}`;
     const cloned = { ...doc, id };
@@ -73,6 +98,8 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
     return { insertedId: id, acknowledged: true };
   }
 
+  // Updates the fields listed in update.$set on the first matching document.
+  // Returns how many documents matched and how many were changed.
   async updateOne(filter: Record<string, any>, update: { $set?: Partial<T> }): Promise<{ matchedCount: number; modifiedCount: number }> {
     const existing = await this.findOne(filter);
     if (!existing) return { matchedCount: 0, modifiedCount: 0 };
@@ -81,6 +108,8 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
     return { matchedCount: 1, modifiedCount: 1 };
   }
 
+  // Removes the first document matching the filter.
+  // Returns how many documents were deleted.
   async deleteOne(filter: Record<string, any>): Promise<{ deletedCount: number; acknowledged: boolean }> {
     const existing = await this.findOne(filter);
     if (!existing) return { deletedCount: 0, acknowledged: true };
@@ -88,24 +117,30 @@ class InMemoryMongoCollection<T extends { id: string }> implements IMongoCollect
     return { deletedCount: 1, acknowledged: true };
   }
 
+  // Counts how many documents match the filter.
   async countDocuments(filter: Record<string, any> = {}): Promise<number> {
     const list = await this.find(filter).toArray();
     return list.length;
   }
 
+  // Creates an index (used to speed up lookups). Since this is in-memory,
+  // there is nothing to actually create; it just returns a made-up name.
   async createIndex(indexSpec: Record<string, number>, _options?: Record<string, any>): Promise<string> {
     const name = Object.keys(indexSpec).join('_');
     return `${this.name}_${name}`;
   }
 }
 
-// Native MongoDB Collection adapter for real external MongoDB instances
+// A wrapper around a real MongoDB collection.
+// It translates the results, dropping MongoDB's internal _id key when
+// returning documents so the data matches the app's format.
 class NativeMongoCollection<T extends { id: string }> implements IMongoCollection<T> {
   private col: any;
   constructor(col: any) {
     this.col = col;
   }
 
+  // Returns all documents matching the filter, minus the _id field.
   find(filter: Record<string, any> = {}): { toArray(): Promise<T[]> } {
     return {
       toArray: async () => {
@@ -118,6 +153,7 @@ class NativeMongoCollection<T extends { id: string }> implements IMongoCollectio
     };
   }
 
+  // Returns the first matching document (without _id), or null.
   async findOne(filter: Record<string, any>): Promise<T | null> {
     const doc = await this.col.findOne(filter);
     if (!doc) return null;
@@ -125,6 +161,7 @@ class NativeMongoCollection<T extends { id: string }> implements IMongoCollectio
     return rest as T;
   }
 
+  // Saves a new document, mapping the app id onto MongoDB's _id key.
   async insertOne(doc: T): Promise<{ insertedId: string; acknowledged: boolean }> {
     const id = doc.id || `doc_${crypto.randomUUID().slice(0, 8)}`;
     const cloned = { ...doc, id };
@@ -132,38 +169,57 @@ class NativeMongoCollection<T extends { id: string }> implements IMongoCollectio
     return { insertedId: id, acknowledged: res.acknowledged };
   }
 
+  // Updates fields on the first matching document; passes the request straight to MongoDB.
   async updateOne(filter: Record<string, any>, update: { $set?: Partial<T> }): Promise<{ matchedCount: number; modifiedCount: number }> {
     const res = await this.col.updateOne(filter, update);
     return { matchedCount: res.matchedCount, modifiedCount: res.modifiedCount };
   }
 
+  // Deletes the first matching document; passes straight to MongoDB.
   async deleteOne(filter: Record<string, any>): Promise<{ deletedCount: number; acknowledged: boolean }> {
     const res = await this.col.deleteOne(filter);
     return { deletedCount: res.deletedCount, acknowledged: res.acknowledged };
   }
 
+  // Counts matching documents; passes straight to MongoDB.
   async countDocuments(filter: Record<string, any> = {}): Promise<number> {
     return this.col.countDocuments(filter);
   }
 
-  async createIndex(indexSpec: Record<string, number>, options?: Record<string, any>): Promise<string> {
+  // Creates an index; passes straight to MongoDB.
+  createIndex(indexSpec: Record<string, number>, options?: Record<string, any>): Promise<string> {
     return this.col.createIndex(indexSpec, options);
   }
 }
 
+// The main service that holds the two collections (events and users) and
+// decides which storage engine to use.
 class MongoService {
+  // True when connected to a real MongoDB server.
   public isConnectedToNativeMongo = false;
   public mongoClient: MongoClient | null = null;
   public nativeDb: Db | null = null;
 
+  // The two collections used across the app.
   public eventsCollection: IMongoCollection<MongoEventDoc>;
   public usersCollection: IMongoCollection<MongoUserDoc>;
 
   constructor() {
+    // Start with the in-memory store. If a real MongoDB is reachable during
+    // init(), these get replaced with the real collection wrappers.
     this.eventsCollection = new InMemoryMongoCollection<MongoEventDoc>('events');
     this.usersCollection = new InMemoryMongoCollection<MongoUserDoc>('users');
   }
 
+  // Connects to the database (called once when the server starts).
+  //
+  // How it works:
+  // - If MONGODB_URI / MONGO_URI is set, it tries to connect to that MongoDB.
+  // - On success it swaps the collections for the real MongoDB-backed ones and
+  //   creates indexes for fast lookups (by user + time, by category, by email/id).
+  // - On failure it warns and keeps using the in-memory store.
+  // - Either way, it ends by seeding two demo users (Alice and Bob) and
+  //   a set of example events.
   public async init(): Promise<void> {
     const mongoUri = process.env.MONGODB_URI || process.env.MONGO_URI;
     if (mongoUri) {
@@ -187,6 +243,7 @@ class MongoService {
         const nativeUsers = this.nativeDb.collection<MongoUserDoc>('users');
         this.eventsCollection = new NativeMongoCollection<MongoEventDoc>(nativeEvents);
         this.usersCollection = new NativeMongoCollection<MongoUserDoc>(nativeUsers);
+        // Indexes speed up common queries.
         await nativeEvents.createIndex({ userId: 1, startTime: 1 });
         await nativeEvents.createIndex({ userId: 1, category: 1 });
         await nativeUsers.createIndex({ email: 1 }, { unique: true });
@@ -202,6 +259,9 @@ class MongoService {
     await this.seedInitialDocuments();
   }
 
+  // Fills the database with demo data so the server is useful right away.
+  // It adds two test students (Alice and Bob) with known passwords and a
+  // handful of example HKUST events, but only if they are not already there.
   private async seedInitialDocuments() {
     // Seed Alice & Bob users
     const alice: MongoUserDoc = {
@@ -342,6 +402,8 @@ class MongoService {
     console.log(`MongoDB collections initialized with ${seedEvents.length} events and 2 users.`);
   }
 
+  // Inserts a document into a collection only if a document with the same id
+  // does not already exist. Used to avoid duplicate seed data on restart.
   private async insertIfMissing<T extends { id: string }>(collection: IMongoCollection<T>, doc: T): Promise<void> {
     const existing = await collection.findOne({ id: doc.id });
     if (!existing) {
@@ -350,6 +412,8 @@ class MongoService {
   }
 }
 
+// Hides the username and password of a MongoDB connection string before
+// printing it to the console, so secrets are not leaked.
 function redactMongoUri(uri: string): string {
   try {
     const parsed = new URL(uri);
@@ -363,4 +427,5 @@ function redactMongoUri(uri: string): string {
   }
 }
 
+// A single shared instance used everywhere in the app.
 export const mongoService = new MongoService();

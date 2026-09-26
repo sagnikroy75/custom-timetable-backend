@@ -1,3 +1,11 @@
+// This file implements a small "toolbox" that AI assistants can call
+// through the Model Context Protocol (MCP). It speaks JSON-RPC 2.0, a simple
+// message format, so a chat assistant can list events, create events, check
+// for schedule clashes, find free time, and export a calendar.
+//
+// The main function here is handleMCPRequest: you give it a user id and a
+// request message, and it performs the requested action and returns a reply.
+
 import { storage } from './storage';
 import { generateICS } from './ics';
 import type { CreateEventInput } from './types';
@@ -7,6 +15,11 @@ import type { CreateEventInput } from './types';
  * Provides JSON-RPC tools for timetable scheduling, conflict checks, and event management.
  */
 
+// The shape of an incoming request message from an AI assistant.
+// - jsonrpc: must always be "2.0" (the message format version).
+// - id: a number or string the assistant uses to match the reply to the request.
+// - method: what to do, e.g. "tools/list" or "tools/call".
+// - params: the details of the call (tool name plus its arguments).
 export interface MCPRequest {
   jsonrpc: '2.0';
   id?: string | number;
@@ -14,6 +27,8 @@ export interface MCPRequest {
   params?: Record<string, any>;
 }
 
+// Describes one tool that an assistant can use. It lists the tool's name,
+// what it does, and the input fields (with their types) that it accepts.
 export interface MCPToolDefinition {
   name: string;
   description: string;
@@ -24,6 +39,10 @@ export interface MCPToolDefinition {
   };
 }
 
+// The catalog of tools offered to AI assistants.
+// Each entry defines the name, a human-readable description of what it does,
+// and the input fields it expects. An assistant fetches this list first
+// (via "tools/list") and then calls a tool by name (via "tools/call").
 export const MCP_TOOLS: MCPToolDefinition[] = [
   {
     name: 'list_events',
@@ -102,6 +121,23 @@ export const MCP_TOOLS: MCPToolDefinition[] = [
   },
 ];
 
+// Processes one JSON-RPC request from an AI assistant and returns a reply.
+//
+// Parameters:
+// - userId: whose timetable the request applies to (from the login token).
+// - request: the incoming message (jsonrpc version, id, method, params).
+//
+// What it handles:
+// - If the message is not version 2.0, it replies with an "invalid request" error.
+// - "tools/list" returns the catalog of available tools (MCP_TOOLS).
+// - "tools/call" runs the named tool and returns the result as text.
+//   - list_events      -> lists the user's events (optionally filtered/expanded)
+//   - create_event     -> creates an event and also reports any schedule clashes
+//   - detect_clashes   -> checks whether a time window overlaps existing events
+//   - find_free_slots  -> finds free time blocks on a given date
+//   - export_ics       -> builds an .ics calendar string the assistant can share
+// - Any unknown method or tool name gets a "method not found" error.
+// - If a tool throws an error, the reply marks it as an error result.
 export function handleMCPRequest(userId: string, request: MCPRequest) {
   const { jsonrpc, id, method, params } = request;
 
@@ -115,6 +151,7 @@ export function handleMCPRequest(userId: string, request: MCPRequest) {
 
   switch (method) {
     case 'tools/list':
+      // Ask an assistant for the list of available tools.
       return {
         jsonrpc: '2.0',
         id,
@@ -140,7 +177,7 @@ export function handleMCPRequest(userId: string, request: MCPRequest) {
           });
           contentText = JSON.stringify(events, null, 2);
         } else if (toolName === 'create_event') {
-          // Check clash first
+          // Check clash first, so the reply can warn about overlaps.
           const clash = storage.detectClashes(userId, {
             startTime: args.startTime,
             endTime: args.endTime,
@@ -181,6 +218,7 @@ export function handleMCPRequest(userId: string, request: MCPRequest) {
           };
         }
 
+        // Wrap the produced text in the standard JSON-RPC "result" shape.
         return {
           jsonrpc: '2.0',
           id,
@@ -194,6 +232,8 @@ export function handleMCPRequest(userId: string, request: MCPRequest) {
           },
         };
       } catch (err: any) {
+        // If running the tool failed, return the error message as a result
+        // marked with isError: true, so the assistant can read it.
         return {
           jsonrpc: '2.0',
           id,
@@ -211,6 +251,7 @@ export function handleMCPRequest(userId: string, request: MCPRequest) {
     }
 
     default:
+      // Anything that is not tools/list or tools/call is not supported.
       return {
         jsonrpc: '2.0',
         id,

@@ -1,3 +1,12 @@
+// This file wires up the authentication endpoints.
+// It registers routes for:
+// - listing the test users (/users),
+// - logging in with email + password (/auth/login),
+// - creating a new account (/auth/signup), and
+// - showing the current logged-in user's details (/auth/me).
+//
+// Each route is registered twice: under the root path and under /api.
+
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import crypto from 'crypto';
 import { requireAuth, signToken, hashPassword, verifyPasswordHash } from '../auth';
@@ -8,6 +17,8 @@ type SignupRequest = FastifyRequest<{
   Body: { email?: string; name?: string; department?: string; password?: string };
 }>;
 
+// Turns a full user document into a safe, public version to send to clients.
+// It deliberately leaves out private fields like the password hash.
 function toPublicUser(user: MongoUserDoc) {
   return {
     id: user.id,
@@ -18,11 +29,24 @@ function toPublicUser(user: MongoUserDoc) {
   };
 }
 
+// Cleans up an email address so login and signup matching is case-insensitive
+// and whitespace is ignored.
 function normalizeEmail(email: string): string {
   return email.toLowerCase().trim();
 }
 
+// Registers all the authentication routes on the Fastify app.
+//
+// Endpoints added:
+// GET  /users                  - list the seeded test accounts and their dev tokens
+// POST /auth/login             - log in with email and password, get a token
+// POST /auth/signup            - create a new account, get a token
+// GET  /auth/me                - show the current user (requires authentication)
+//
+// (Each one is also available under the /api prefix.)
 export function registerAuthRoutes(app: FastifyInstance) {
+  // Lists every user in the database, along with the dev token that works
+  // for them (just their id followed by "-dev-token").
   const usersHandler = async () => {
     const users = (await mongoService.usersCollection.find({}).toArray()).map((u) => ({
       id: u.id,
@@ -38,6 +62,8 @@ export function registerAuthRoutes(app: FastifyInstance) {
   app.get('/users', usersHandler);
   app.get('/api/users', usersHandler);
 
+  // Handles login: checks the email and password against the stored user.
+  // On success returns the user and a bearer token valid for 7 days.
   const loginHandler = async (req: LoginRequest, reply: FastifyReply) => {
     const { email, password } = req.body || {};
     if (!email || !password) {
@@ -56,6 +82,9 @@ export function registerAuthRoutes(app: FastifyInstance) {
   app.post('/auth/login', loginHandler);
   app.post('/api/auth/login', loginHandler);
 
+  // Handles signup: makes sure the fields are present and the password is at
+  // least 6 characters, then creates the account (generating a unique id and
+  // storing only a password hash). It also rejects duplicate emails.
   const signupHandler = async (req: SignupRequest, reply: FastifyReply) => {
     const { email, name, department, password } = req.body || {};
 
@@ -93,6 +122,8 @@ export function registerAuthRoutes(app: FastifyInstance) {
   app.post('/auth/signup', signupHandler);
   app.post('/api/auth/signup', signupHandler);
 
+  // Shows the currently logged-in user's public details. The requireAuth
+  // guard runs first and sets req.user, which tells us who is asking.
   const meHandler = async (req: FastifyRequest, reply: FastifyReply) => {
     const user = await mongoService.usersCollection.findOne({ id: req.user!.id });
     if (!user) {

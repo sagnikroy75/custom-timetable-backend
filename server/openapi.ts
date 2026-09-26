@@ -1,3 +1,9 @@
+// This file contains a full description of the API in the OpenAPI format.
+// It tells Swagger (and anyone reading the docs) every endpoint this server
+// offers, what parameters each endpoint accepts, what responses it returns,
+// and how authentication works. It powers the interactive documentation page
+// at /documentation and the raw spec at /openapi.json.
+
 export const openApiSpec = {
   openapi: '3.0.3',
   info: {
@@ -5,6 +11,7 @@ export const openApiSpec = {
     description: ``,
     version: '1.0.0'
   },
+  // The topic groups that the API endpoints are organised into.
   tags: [
     { name: 'Events', description: 'Timetable event management and CRUD query operations' },
     { name: 'Scheduling & Clashes', description: 'Schedule conflict detection and available slot calculations' },
@@ -12,7 +19,11 @@ export const openApiSpec = {
     { name: 'Model Context Protocol (MCP)', description: 'AI assistant JSON-RPC 2.0 integration' },
     { name: 'Auth & Test Users', description: 'User profiles and testing credentials' },
   ],
+  // Reusable building blocks: how clients prove who they are, and the
+  // data shapes used across the endpoints.
   components: {
+    // The two ways a client can authenticate: a Bearer token in the
+    // Authorization header, or a simple x-user-id header for testing.
     securitySchemes: {
       BearerAuth: {
         type: 'http',
@@ -27,6 +38,12 @@ export const openApiSpec = {
         description: 'Alternative direct user header for testing (`alice` or `bob`)',
       },
     },
+    // The data shapes used by the API, described once and reused everywhere.
+    // - RecurrenceRule: how an event repeats.
+    // - CustomEvent: the main event object.
+    // - CreateEventInput: what to send when creating a new event.
+    // - ClashCheckInput: what to send when checking for schedule clashes.
+    // - MCPRequest: what an AI assistant sends to the /mcp endpoint.
     schemas: {
       RecurrenceRule: {
         type: 'object',
@@ -151,10 +168,12 @@ export const openApiSpec = {
       },
     },
   },
+  // By default, every endpoint may be called with either authentication method.
   security: [
     { BearerAuth: [] },
     { HeaderUserId: [] },
   ],
+  // The actual endpoints of the API, each with its parameters and responses.
   paths: {
     '/events': {
       get: {

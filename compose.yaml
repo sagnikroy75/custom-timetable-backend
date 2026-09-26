@@ -1,10 +1,26 @@
+# Local development MongoDB for template-api (MONGO_URI points here by
+# default). Without it, dev and tests fall back to an in-memory MongoDB.
+#
+# Start it:
+#
+#   docker compose up -d
+#
+# Stop it:
+#
+#   docker compose stop
+#
+# Reset the data volume:
+#
+#   docker compose down -v
 services:
   api:
     build:
       context: .
     container_name: custom-timetable-api
     ports:
+      # host port 3000 -> container port 3000
       - "3000:3000"
+    # Configuration values (PORT, MONGODB_URI, JWT_SECRET, ...) come from .env
     env_file:
       - .env
     environment:

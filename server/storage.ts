@@ -9,14 +9,27 @@ import type {
   DayOfWeek,
 } from './types';
 
+// This file contains the "brain" of the timetable service.
+// It keeps events in an in-memory list and provides the logic for:
+// - creating, reading, updating and deleting events,
+// - turning repeating events into individual occurrences,
+// - spotting schedule clashes (overlaps), and
+// - finding free time slots on a given day.
+//
+// All methods are scoped by userId, so one student can never see or touch
+// another student's events.
+
 // In-memory data store for the customizable timetable service
 class TimetableStorage {
+  // Events are kept in a Map keyed by event id.
   private events: Map<string, CustomEvent> = new Map();
 
   constructor() {
     this.seedInitialData();
   }
 
+  // Adds some example events when the server starts, so the API already has
+  // realistic HKUST timetable data to play with.
   private seedInitialData() {
     // Seed realistic HKUST semester events for current week (September 2026)
     const seedEvents: CustomEvent[] = [
@@ -133,6 +146,12 @@ class TimetableStorage {
 
   // --- Event CRUD Operations (Strictly Scoped by userId) ---
 
+  // Creates a new event for a user and stores it.
+  //
+  // Checks first that the event has a title and that startTime/endTime are
+  // real times with the end after the start. It then builds the event (with
+  // a fresh id, the current time stamps, and a default color based on the
+  // category), saves it, and returns the new event.
   public createEvent(userId: string, input: CreateEventInput): CustomEvent {
     // Basic validation
     if (!input.title || !input.title.trim()) {
@@ -175,10 +194,16 @@ class TimetableStorage {
     return newEvent;
   }
 
+  // Copies an event that was saved in MongoDB into the local in-memory store.
+  // This keeps the fast in-memory logic (clash detection, free-slot finding,
+  // .ics export) in sync with the database.
   public syncEventFromMongo(event: CustomEvent): void {
     this.events.set(event.id, event);
   }
 
+  // Looks up a single event by id for a specific user.
+  // It only returns the event if it belongs to that user; otherwise it
+  // returns null (so users can't read each other's events).
   public getEventById(userId: string, eventId: string): CustomEvent | null {
     const event = this.events.get(eventId);
     if (!event) return null;
@@ -187,6 +212,10 @@ class TimetableStorage {
     return event;
   }
 
+  // Updates an existing event of a user.
+  // Only the fields that are actually provided get changed. It also makes
+  // sure any new times are valid, and stamps the new updatedAt time.
+  // Returns the updated event, or null if the event wasn't found.
   public updateEvent(userId: string, eventId: string, input: UpdateEventInput): CustomEvent | null {
     const event = this.getEventById(userId, eventId);
     if (!event) return null;
@@ -219,6 +248,8 @@ class TimetableStorage {
     return updated;
   }
 
+  // Deletes an event belonging to a user.
+  // Returns true if it was deleted, false if the event wasn't found.
   public deleteEvent(userId: string, eventId: string): boolean {
     const event = this.getEventById(userId, eventId);
     if (!event) return false;
@@ -227,6 +258,17 @@ class TimetableStorage {
 
   /**
    * List events with query filters and optional recurring event expansion.
+   *
+   * Parameters (inside options - all optional):
+   * - start / end: only events touching this time range are returned.
+   * - category: only events of this category are returned.
+   * - search: only events whose title, description, or location contains this
+   *   text (case-insensitive) are returned.
+   * - expandRecurring: when true (default), repeating events are expanded
+   *   into every individual occurrence inside the requested range. When
+   *   false, only the "master" repeating event is returned as-is.
+   *
+   * Returns events sorted by start time, earliest first.
    */
   public listEvents(
     userId: string,
@@ -238,6 +280,7 @@ class TimetableStorage {
       expandRecurring?: boolean;
     } = {}
   ): CustomEvent[] {
+    // Only this user's events.
     const userEvents = Array.from(this.events.values()).filter((e) => e.userId === userId);
 
     const queryStart = options.start ? new Date(options.start).getTime() : null;
@@ -252,6 +295,7 @@ class TimetableStorage {
         const eStart = new Date(evt.startTime).getTime();
         const eEnd = new Date(evt.endTime).getTime();
 
+        // Skip if it's entirely outside the requested time range.
         if (queryStart !== null && eEnd < queryStart) continue;
         if (queryEnd !== null && eStart > queryEnd) continue;
 
@@ -269,6 +313,7 @@ class TimetableStorage {
       } else {
         // Event has recurrence rule
         if (shouldExpand && queryStart !== null && queryEnd !== null) {
+          // Expand the series into individual occurrences in this range.
           const expanded = this.expandRecurringEvent(evt, queryStart, queryEnd);
           for (const occ of expanded) {
             if (options.category && occ.category !== options.category) continue;
@@ -307,6 +352,25 @@ class TimetableStorage {
   /**
    * Recurrence Expansion Algorithm:
    * Expands a master recurring event into discrete occurrences inside [windowStart, windowEnd]
+   *
+   * Parameters:
+   * - master: the repeating event to expand.
+   * - windowStart / windowEnd: the time range we are interested in (as
+   *   millisecond timestamps).
+   *
+   * How it works:
+   * - DAILY: walks forward one day at a time (times the interval) and creates
+   *   an occurrence for each step inside the window.
+   * - WEEKLY: walks forward one week at a time. Inside each week it creates an
+   *   occurrence for every allowed weekday (from byDay, or the event's own
+   *   weekday if byDay is empty).
+   * - MONTHLY: walks forward one month at a time.
+   * - Anything else: returns the master event as a single occurrence.
+   *
+   * Each generated occurrence is a copy of the master event with its own id,
+   * concrete start/end times, and isOccurrence flagged true. It stops early
+   * when the series' "until" date or a safety ceiling (200 occurrences) or
+   * the window end is reached.
    */
   public expandRecurringEvent(
     master: CustomEvent,
@@ -325,6 +389,7 @@ class TimetableStorage {
     const maxCount = rule.count || 200; // safety ceiling
     const ruleUntil = rule.until ? new Date(rule.until).getTime() : null;
 
+    // Maps short day names to JavaScript's day numbers (0 = Sunday).
     const dayMap: Record<DayOfWeek, number> = {
       SU: 0,
       MO: 1,
@@ -346,6 +411,7 @@ class TimetableStorage {
         if (ruleUntil !== null && curStartMs > ruleUntil) break;
         if (curStartMs > windowEnd) break;
 
+        // Keep it only if it actually overlaps the requested window.
         if (curEndMs >= windowStart && curStartMs <= windowEnd) {
           occurrences.push({
             ...master,
@@ -375,6 +441,7 @@ class TimetableStorage {
       while (count < maxCount) {
         let anyOccAdded = false;
 
+        // Walk through each day of the current week.
         for (const day of [0, 1, 2, 3, 4, 5, 6]) {
           if (allowedDays.includes(day)) {
             const occStart = new Date(cursor.getTime());
@@ -450,6 +517,15 @@ class TimetableStorage {
   /**
    * Conflict / Clash Detection:
    * Checks if an event overlaps with any existing events of the user.
+   *
+   * Parameters:
+   * - userId: whose schedule to check.
+   * - proposed: the candidate start/end times, plus an optional event id to
+   *   ignore (used when updating an event so it doesn't clash with itself).
+   *
+   * Returns a ClashResult listing every existing event whose time overlaps
+   * the proposed window, along with the overlap duration and exact times,
+   * plus a hasClash flag.
    */
   public detectClashes(
     userId: string,
@@ -458,7 +534,8 @@ class TimetableStorage {
     const propStart = new Date(proposed.startTime).getTime();
     const propEnd = new Date(proposed.endTime).getTime();
 
-    // Query window around the proposed event
+    // Get all the user's events that touch this window (repeating events
+    // are expanded so their occurrences are checked too).
     const events = this.listEvents(userId, {
       start: proposed.startTime,
       end: proposed.endTime,
@@ -468,6 +545,7 @@ class TimetableStorage {
     const clashingEvents: ClashResult['clashingEvents'] = [];
 
     for (const evt of events) {
+      // Skip the event being updated/its own occurrences.
       if (proposed.excludeEventId && (evt.id === proposed.excludeEventId || evt.masterEventId === proposed.excludeEventId)) {
         continue;
       }
@@ -498,6 +576,22 @@ class TimetableStorage {
 
   /**
    * Find Free Slots for scheduling a study session, meeting, or assignment:
+   *
+   * Parameters:
+   * - userId: whose timetable to look at.
+   * - targetDate: the day to search, as "YYYY-MM-DD".
+   * - options.dayStartHour / dayEndHour: the earliest/latest hour of the
+   *   "school day" to consider (defaults 9 and 21).
+   * - options.minDurationMinutes: only return free blocks at least this long
+   *   (default 30).
+   *
+   * How it works:
+   * - It collects every event on that day, clips it to the school-day window,
+   *   and merges overlapping busy intervals into continuous blocks.
+   * - It then walks from the start of the day to the end, and every gap
+   *   between busy blocks that is long enough becomes a free slot.
+   *
+   * Returns a list of free slots (start, end, durationMinutes).
    */
   public findFreeSlots(
     userId: string,
@@ -518,19 +612,21 @@ class TimetableStorage {
     const dayEnd = new Date(`${targetDate}T00:00:00.000Z`);
     dayEnd.setUTCHours(endHour, 0, 0, 0);
 
+    // Every event that touches this day (recurring ones expanded).
     const events = this.listEvents(userId, {
       start: dayStart.toISOString(),
       end: dayEnd.toISOString(),
       expandRecurring: true,
     });
 
-    // Sort events
+    // Convert events to busy intervals clipped to the school-day window,
+    // dropping empty ones and sorting by start time.
     const busyIntervals: { start: number; end: number }[] = events.map((e) => ({
       start: Math.max(dayStart.getTime(), new Date(e.startTime).getTime()),
       end: Math.min(dayEnd.getTime(), new Date(e.endTime).getTime()),
     })).filter((i) => i.start < i.end).sort((a, b) => a.start - b.start);
 
-    // Merge overlapping busy intervals
+    // Merge overlapping or touching busy intervals into single blocks.
     const mergedBusy: { start: number; end: number }[] = [];
     for (const b of busyIntervals) {
       if (mergedBusy.length === 0) {
@@ -548,6 +644,7 @@ class TimetableStorage {
     const freeSlots: FreeSlot[] = [];
     let cursor = dayStart.getTime();
 
+    // For each busy block, the gap before it (if long enough) is a free slot.
     for (const busy of mergedBusy) {
       if (busy.start > cursor) {
         const diffMinutes = Math.round((busy.start - cursor) / 60000);
@@ -562,6 +659,7 @@ class TimetableStorage {
       cursor = Math.max(cursor, busy.end);
     }
 
+    // And finally the gap between the last busy block and the end of the day.
     if (dayEnd.getTime() > cursor) {
       const diffMinutes = Math.round((dayEnd.getTime() - cursor) / 60000);
       if (diffMinutes >= minDuration) {
@@ -576,6 +674,8 @@ class TimetableStorage {
     return freeSlots;
   }
 
+  // Picks a default calendar colour for a category, so events look nice
+  // even when the client doesn't specify one.
   private getDefaultColor(category: string): string {
     const colors: Record<string, string> = {
       lecture: '#2563eb', // Blue
@@ -591,4 +691,5 @@ class TimetableStorage {
   }
 }
 
+// A single shared instance of the storage, used across the whole app.
 export const storage = new TimetableStorage();
